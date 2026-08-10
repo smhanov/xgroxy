@@ -7,7 +7,7 @@ One file. Zero dependencies. No npm. No Docker. No build step. Just Python.
 If you pay for Grok through X Premium+ or SuperGrok, you already have access to
 Grok 4.5 — but only through the web app or the `grok` CLI. `xgroxy` unlocks that
 same subscription as a plain OpenAI-compatible HTTP endpoint, so any tool that
-speaks OpenAI (OpenCode, Claude Code, Cursor, Continue, LangChain, curl...) can
+speaks OpenAI (OpenCode, Cursor, Continue, LangChain, curl...) can
 use Grok for free, no API credits required.
 
 ```text
@@ -123,7 +123,7 @@ xgroxy serve
 ```
 
 ```
-xgroxy 1.0.1 — Grok on http://127.0.0.1:8788
+xgroxy 1.1.1 — Grok on http://127.0.0.1:8788
 signed in as you@example.com · token exp 2026-08-10T19:05:28.000Z
 model grok-4.5
 ```
@@ -177,8 +177,6 @@ Or with a coding agent (tools run on *your* machine):
 ```bash
 # OpenCode
 opencode run "list the files here" --model xai/grok-4.5   # baseURL → http://127.0.0.1:8788/v1
-# Claude Code
-claude --model grok-4.5                                    # ANTHROPIC_BASE_URL → http://127.0.0.1:8788/v1
 ```
 
 ## How the magic works
@@ -237,19 +235,13 @@ Environment variable: `XGROXY_AUTH_FILE` (same as `--auth-file`).
 opencode run "what's in this repo?" --model xai/grok-4.5
 ```
 
-### Claude Code
-
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8788/v1
-export ANTHROPIC_AUTH_TOKEN=xgroxy
-export ANTHROPIC_MODEL=grok-4.5
-claude
-```
-
 ### Anything else
 
 Any OpenAI-compatible client: set `base_url` (or `OPENAI_BASE_URL`) to
 `http://127.0.0.1:8788/v1`, model `grok-4.5`, any API key.
+
+Clients that only speak Anthropic's `/v1/messages` protocol are not directly
+supported; they need an OpenAI-compatible provider or adapter.
 
 ## Security notes
 
@@ -276,6 +268,15 @@ Any OpenAI-compatible client: set `base_url` (or `OPENAI_BASE_URL`) to
 | It works, then stops after hours | Access token expired — that's normal, refresh is automatic. If it *keeps* failing, your X session was revoked; re-run `login`. |
 | Server dies when terminal closes | `xgroxy install-service` (systemd), or `xgroxy serve > /tmp/xgroxy.log 2>&1 &` |
 | Service won't start at boot/login | `systemctl --user status xgroxy`; on headless hosts try `loginctl enable-linger $USER` |
+
+## Development
+
+The regression suite uses only the Python standard library and never contacts
+xAI or reads your real auth file:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ## FAQ
 

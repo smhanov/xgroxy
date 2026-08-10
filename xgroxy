@@ -7,6 +7,7 @@ Single file, stdlib only, Python 3.8+.
 from __future__ import annotations
 
 import argparse
+import hmac
 import http.server
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -31,7 +33,7 @@ try:
 except Exception:
     pass
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 SERVICE_NAME = "xgroxy.service"
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -53,10 +55,10 @@ MAX_BODY = 10 * 1024 * 1024
 
 def _auth_file_path(explicit: str | None = None) -> Path:
     if explicit:
-        return Path(explicit)
+        return Path(explicit).expanduser()
     env = os.environ.get("XGROXY_AUTH_FILE")
     if env:
-        return Path(env)
+        return Path(env).expanduser()
     grok_cli = Path.home() / ".grok" / "auth.json"
     if grok_cli.exists():
         return grok_cli
@@ -74,26 +76,53 @@ def read_auth(explicit: str | None = None) -> dict:
         return {}
 
     if isinstance(data, dict) and data:
-        entry = data.get(list(data.keys())[0])
-        if isinstance(entry, dict):
-            entry["_auth_path"] = str(path)
-            entry["_scope_key"] = list(data.keys())[0]
-            return entry
+        # Prefer our own OAuth entry. Shared Grok auth files can contain other
+        # issuers, so selecting the first JSON key is both unreliable and
+        # potentially destructive when the token is refreshed.
+        candidates = [CLIENT_ID_SCOPE_KEY]
+        candidates.extend(key for key in data if key != CLIENT_ID_SCOPE_KEY)
+        for scope_key in candidates:
+            entry = data.get(scope_key)
+            if isinstance(entry, dict) and (entry.get("key") or entry.get("refresh_token")):
+                result = dict(entry)
+                result["_auth_path"] = str(path)
+                result["_scope_key"] = scope_key
+                return result
     return {}
 
 
 def write_auth(entry: dict, explicit: str | None = None) -> None:
     path = _auth_file_path(explicit)
-    scope_key = entry.pop("_scope_key", CLIENT_ID_SCOPE_KEY)
-    entry.pop("_auth_path", None)
-    data = {scope_key: entry}
+    scope_key = entry.get("_scope_key", CLIENT_ID_SCOPE_KEY)
+    clean_entry = {k: v for k, v in entry.items() if not k.startswith("_auth_") and k != "_scope_key"}
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+    # Preserve unrelated credentials when reusing ~/.grok/auth.json.
+    data = {}
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                data = existing
+        except (json.JSONDecodeError, OSError):
+            pass
+    data[scope_key] = clean_entry
+
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 CLIENT_ID_SCOPE_KEY = f"{OAUTH_ISSUER}::{CLIENT_ID}"
@@ -108,13 +137,23 @@ def _http_form_post(url: str, fields: dict, headers: dict | None = None) -> dict
             req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Invalid JSON response from {urllib.parse.urlsplit(url).netloc}") from e
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"Unexpected response from {urllib.parse.urlsplit(url).netloc}")
+            return parsed
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         try:
             return json.loads(body)
         except json.JSONDecodeError:
             raise RuntimeError(f"HTTP {e.code}: {body}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(f"Could not connect to {urllib.parse.urlsplit(url).netloc}: "
+                           f"{getattr(e, 'reason', e)}") from e
 
 
 def _http_get(url: str, token: str) -> dict:
@@ -122,19 +161,31 @@ def _http_get(url: str, token: str) -> dict:
     req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read().decode("utf-8")
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError as e:
+                raise RuntimeError(f"Invalid JSON response from {urllib.parse.urlsplit(url).netloc}") from e
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"Unexpected response from {urllib.parse.urlsplit(url).netloc}")
+            return parsed
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         try:
             return json.loads(body)
         except json.JSONDecodeError:
             raise RuntimeError(f"HTTP {e.code}: {body}") from e
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise RuntimeError(f"Could not connect to {urllib.parse.urlsplit(url).netloc}: "
+                           f"{getattr(e, 'reason', e)}") from e
 
 
 def _parse_expiry(expires_at: str) -> float:
     """Parse ISO timestamp to epoch seconds (UTC)."""
     try:
         dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
     except Exception:
         return 0.0
@@ -156,9 +207,16 @@ def _needs_proactive_refresh(entry: dict) -> bool:
 def refresh_token(entry: dict, explicit_path: str | None = None, force: bool = False) -> dict:
     """Refresh the access token. Set force=True for reactive (401) refreshes."""
     with _refresh_lock:
-        # For proactive refreshes, double-check after acquiring lock
-        if not force and not _needs_proactive_refresh(entry):
-            return entry
+        auth_path = explicit_path or entry.get("_auth_path")
+        # Another request may already have rotated the refresh token while we
+        # waited for the lock. Reuse its result instead of submitting the old
+        # one (which OAuth servers commonly invalidate immediately).
+        current = read_auth(auth_path)
+        if current and current.get("key") != entry.get("key"):
+            return current
+        if not force and not _needs_proactive_refresh(current or entry):
+            return current or entry
+        entry = current or entry
         refresh = entry.get("refresh_token", "")
         if not refresh:
             raise RuntimeError("No refresh token available — run xgroxy login")
@@ -173,7 +231,10 @@ def refresh_token(entry: dict, explicit_path: str | None = None, force: bool = F
         if not new_access:
             raise RuntimeError(f"Token refresh failed: {resp}")
 
-        new_expires_in = resp.get("expires_in", 21600)
+        try:
+            new_expires_in = int(resp.get("expires_in", 21600))
+        except (TypeError, ValueError):
+            new_expires_in = 21600
         new_expires_at = datetime.now(timezone.utc).timestamp() + new_expires_in
         expires_z = datetime.fromtimestamp(new_expires_at, tz=timezone.utc).strftime(
             "%Y-%m-%dT%H:%M:%S.000Z"
@@ -184,7 +245,7 @@ def refresh_token(entry: dict, explicit_path: str | None = None, force: bool = F
         if resp.get("refresh_token"):
             entry["refresh_token"] = resp["refresh_token"]
 
-        write_auth(entry, explicit_path)
+        write_auth(entry, auth_path)
         return entry
 
 
@@ -206,8 +267,12 @@ def cmd_login(args: argparse.Namespace) -> None:
     user_code = resp.get("user_code")
     verification_uri = resp.get("verification_uri", VERIFICATION_PAGE)
     verification_uri_complete = resp.get("verification_uri_complete", "")
-    interval = int(resp.get("interval", 5))
-    expires_in = int(resp.get("expires_in", 1800))
+    try:
+        interval = max(1, int(resp.get("interval", 5)))
+        expires_in = max(1, int(resp.get("expires_in", 1800)))
+    except (TypeError, ValueError):
+        interval = 5
+        expires_in = 1800
 
     if not device_code or not user_code:
         print(f"Error: unexpected response from device code endpoint: {resp}", file=sys.stderr)
@@ -248,11 +313,18 @@ def cmd_login(args: argparse.Namespace) -> None:
         elif error in ("access_denied", "expired_token"):
             print(f"Login failed: {error}", file=sys.stderr, flush=True)
             sys.exit(1)
+        elif error:
+            detail = token_resp.get("error_description", error)
+            print(f"Login failed: {detail}", file=sys.stderr, flush=True)
+            sys.exit(1)
 
         access_token = token_resp.get("access_token")
         if access_token:
             refresh_tok = token_resp.get("refresh_token", "")
-            expires_in_val = token_resp.get("expires_in", 21600)
+            try:
+                expires_in_val = int(token_resp.get("expires_in", 21600))
+            except (TypeError, ValueError):
+                expires_in_val = 21600
             expires_at_ts = datetime.now(timezone.utc).timestamp() + expires_in_val
             expires_at_str = datetime.fromtimestamp(
                 expires_at_ts, tz=timezone.utc
@@ -298,7 +370,8 @@ def _require_auth(args: argparse.Namespace) -> dict:
     entry = read_auth(args.auth_file)
     if not entry:
         path = _auth_file_path(args.auth_file)
-        print(f"No auth file found at {path}. Run 'xgroxy login'.", file=sys.stderr)
+        detail = "No usable authentication found" if path.exists() else "No auth file found"
+        print(f"{detail} at {path}. Run 'xgroxy login'.", file=sys.stderr)
         sys.exit(1)
     return entry
 
@@ -344,24 +417,30 @@ def _build_unit_text(
     model: str,
     auth_file: str | None,
 ) -> str:
-    exec_parts = [sys.executable, str(script), "serve", "--host", host, "--port", str(port)]
+    # Prefer the stable python3 executable found on PATH over a versioned
+    # interpreter target that package-manager upgrades may remove.
+    python = shutil.which("python3") or sys.executable
+    exec_parts = [python, str(script), "serve", "--host", host, "--port", str(port)]
     if model:
         exec_parts.extend(["--model", model])
     if api_key:
         exec_parts.extend(["--api-key", api_key])
     if auth_file:
         exec_parts.extend(["--auth-file", auth_file])
-    # Quote each arg for systemd ExecStart
-    exec_start = " ".join(
-        f'"{p}"' if any(c in p for c in " \t\"'\\") else p for p in exec_parts
-    )
-    env_lines = []
-    if api_key:
-        # Prefer flag above; env is a belt-and-suspenders for wrappers
-        env_lines.append(f"Environment=XGROXY_API_KEY={api_key}")
-    if auth_file:
-        env_lines.append(f"Environment=XGROXY_AUTH_FILE={auth_file}")
-    env_block = ("\n".join(env_lines) + "\n") if env_lines else ""
+    # systemd has its own command-line parser and expands both specifiers and
+    # environment markers even inside quotes. Quote every argument and escape
+    # those expansions so paths/keys containing spaces, %, $, or quotes work.
+    def quote(value: str) -> str:
+        escaped = (value.replace("\\", "\\\\")
+                        .replace('"', '\\"')
+                        .replace("%", "%%")
+                        .replace("$", "$$")
+                        .replace("\n", "\\n")
+                        .replace("\r", "\\r")
+                        .replace("\t", "\\t"))
+        return f'"{escaped}"'
+
+    exec_start = " ".join(quote(p) for p in exec_parts)
     return f"""[Unit]
 Description=xgroxy — local OpenAI-compatible Grok API (X Premium+)
 After=network-online.target
@@ -372,7 +451,7 @@ Type=simple
 ExecStart={exec_start}
 Restart=on-failure
 RestartSec=5
-{env_block}# Do not inherit a restrictive umask that would break 0600 auth writes oddly
+# Keep auth files and any credentials in the unit private to this user.
 UMask=0077
 
 [Install]
@@ -396,15 +475,21 @@ def cmd_install_service(args: argparse.Namespace) -> None:
     script = _resolve_self_path()
     unit_path = _systemd_user_unit_path()
     unit_path.parent.mkdir(parents=True, exist_ok=True)
+    auth_file = str(_auth_file_path(args.auth_file).resolve()) if args.auth_file else None
+    api_key = args.api_key or os.environ.get("XGROXY_API_KEY")
+    if args.host not in ("127.0.0.1", "::1", "localhost") and not api_key:
+        print("WARNING: non-loopback host without --api-key exposes the proxy to the network.",
+              file=sys.stderr)
     text = _build_unit_text(
         script=script,
         host=args.host,
         port=args.port,
-        api_key=args.api_key or os.environ.get("XGROXY_API_KEY"),
+        api_key=api_key,
         model=args.model or DEFAULT_MODEL,
-        auth_file=args.auth_file,
+        auth_file=auth_file,
     )
     unit_path.write_text(text, encoding="utf-8")
+    os.chmod(unit_path, 0o600)
     print(f"Wrote {unit_path}")
 
     try:
@@ -418,12 +503,20 @@ def cmd_install_service(args: argparse.Namespace) -> None:
     # Linger so the service survives logout (optional; best-effort)
     if args.linger:
         try:
-            subprocess.run(
-                ["loginctl", "enable-linger", os.environ.get("USER", "")],
+            user = os.environ.get("USER")
+            if not user:
+                raise RuntimeError("USER is not set")
+            linger = subprocess.run(
+                ["loginctl", "enable-linger", user],
                 check=False, capture_output=True, text=True,
             )
+            if linger.returncode != 0:
+                print(f"Warning: could not enable linger: {(linger.stderr or linger.stdout).strip()}",
+                      file=sys.stderr)
         except FileNotFoundError:
-            pass
+            print("Warning: loginctl not found; linger was not enabled.", file=sys.stderr)
+        except RuntimeError as e:
+            print(f"Warning: linger was not enabled: {e}", file=sys.stderr)
 
     st = _systemctl_user("is-active", SERVICE_NAME, check=False)
     active = (st.stdout or "").strip()
@@ -438,12 +531,14 @@ def cmd_uninstall_service(args: argparse.Namespace) -> None:
     unit_path = _systemd_user_unit_path()
     if shutil.which("systemctl"):
         _systemctl_user("disable", "--now", SERVICE_NAME, check=False)
-        _systemctl_user("daemon-reload", check=False)
     if unit_path.exists():
         unit_path.unlink()
         print(f"Removed {unit_path}")
     else:
         print(f"No unit at {unit_path}")
+    if shutil.which("systemctl"):
+        _systemctl_user("daemon-reload", check=False)
+        _systemctl_user("reset-failed", SERVICE_NAME, check=False)
     print("xgroxy will no longer start at login.")
 
 
@@ -464,20 +559,21 @@ def _scrub_message(msg: dict) -> dict:
     return cleaned
 
 
-def _forward_fields(body: dict) -> dict:
+def _forward_fields(body: dict, default_model: str = DEFAULT_MODEL) -> dict:
     """Extract only the fields we forward to the upstream."""
     allowed = {
         "model", "messages", "stream", "tools", "tool_choice",
         "temperature", "top_p", "max_tokens", "max_completion_tokens",
         "stop", "presence_penalty", "frequency_penalty", "seed",
-        "response_format",
+        "response_format", "n", "parallel_tool_calls", "logprobs",
+        "top_logprobs", "service_tier", "user", "reasoning_effort",
     }
     result = {}
     for k in allowed:
         if k in body:
             result[k] = body[k]
     if "model" not in result:
-        result["model"] = DEFAULT_MODEL
+        result["model"] = default_model
     if "messages" in result:
         result["messages"] = [_scrub_message(m) for m in result["messages"]]
     if "stream_options" in body:
@@ -500,11 +596,17 @@ def _upstream_request(body: dict, token: str) -> tuple[int, dict, dict]:
                 parsed = {"error": {"message": body[:500]}}
             return resp.status, parsed, dict(resp.headers)
     except urllib.error.HTTPError as e:
-        resp_body = e.read().decode("utf-8", errors="replace")
         try:
-            return e.code, json.loads(resp_body), dict(e.headers)
-        except json.JSONDecodeError:
-            return e.code, {"error": {"message": resp_body}}, dict(e.headers)
+            resp_body = e.read().decode("utf-8", errors="replace")
+            try:
+                return e.code, json.loads(resp_body), dict(e.headers or {})
+            except json.JSONDecodeError:
+                return e.code, {"error": {"message": resp_body}}, dict(e.headers or {})
+        finally:
+            e.close()
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        return 502, {"error": {"message": f"Could not connect to xAI: {reason}"}}, {}
 
 
 def _error_json(status: int, message: str, err_type: str = "server_error", code: str = ""):
@@ -536,48 +638,64 @@ def _rewrite_sse_chunk(event_obj: dict, include_usage: bool) -> bytes | None:
     """Rewrite an xAI SSE event object into OpenAI shape. Returns bytes or None."""
     choices = event_obj.get("choices", [])
     if not choices:
+        if include_usage and "usage" in event_obj:
+            chunk = {
+                "id": event_obj.get("id", ""),
+                "object": "chat.completion.chunk",
+                "created": event_obj.get("created", 0),
+                "model": event_obj.get("model", DEFAULT_MODEL),
+                "choices": [],
+                "usage": event_obj["usage"],
+            }
+            return _openai_sse_event(chunk)
         return None
-    choice = choices[0]
-    delta = choice.get("delta", {})
+
+    rewritten_choices = []
+    for choice in choices:
+        delta = choice.get("delta", {})
+        out_delta = {}
+
+        # Preserve standard streaming fields clients use to construct the
+        # final message, plus xAI's reasoning extension.
+        for field in ("role", "content", "refusal", "reasoning_content"):
+            if field in delta:
+                out_delta[field] = delta[field]
+
+        if "tool_calls" in delta:
+            tc_list = []
+            for tc in delta["tool_calls"]:
+                otc = {"index": tc.get("index", 0)}
+                if "id" in tc:
+                    otc["id"] = tc["id"]
+                if "function" in tc:
+                    func = {}
+                    if "name" in tc["function"]:
+                        func["name"] = tc["function"]["name"]
+                    if "arguments" in tc["function"]:
+                        func["arguments"] = tc["function"]["arguments"]
+                    if func:
+                        otc["function"] = func
+                if "type" in tc:
+                    otc["type"] = tc["type"]
+                tc_list.append(otc)
+            out_delta["tool_calls"] = tc_list
+
+        rewritten_choices.append({
+            "index": choice.get("index", 0),
+            "delta": out_delta,
+            "finish_reason": choice.get("finish_reason"),
+        })
 
     chunk = {
         "id": event_obj.get("id", ""),
         "object": "chat.completion.chunk",
         "created": event_obj.get("created", 0),
         "model": event_obj.get("model", DEFAULT_MODEL),
-        "choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason")}],
+        "choices": rewritten_choices,
     }
 
     if "usage" in event_obj and include_usage:
         chunk["usage"] = event_obj["usage"]
-
-    # content
-    if "content" in delta:
-        chunk["choices"][0]["delta"]["content"] = delta["content"]
-
-    # reasoning_content
-    if "reasoning_content" in delta:
-        chunk["choices"][0]["delta"]["reasoning_content"] = delta["reasoning_content"]
-
-    # tool_calls
-    if "tool_calls" in delta:
-        tc_list = []
-        for tc in delta["tool_calls"]:
-            otc = {"index": tc.get("index", 0)}
-            if "id" in tc:
-                otc["id"] = tc["id"]
-            if "function" in tc:
-                func = {}
-                if "name" in tc["function"]:
-                    func["name"] = tc["function"]["name"]
-                if "arguments" in tc["function"]:
-                    func["arguments"] = tc["function"]["arguments"]
-                if func:
-                    otc["function"] = func
-            if "type" in tc:
-                otc["type"] = tc["type"]
-            tc_list.append(otc)
-        chunk["choices"][0]["delta"]["tool_calls"] = tc_list
 
     return _openai_sse_event(chunk)
 
@@ -587,27 +705,48 @@ def _rewrite_sse_chunk(event_obj: dict, include_usage: bool) -> bytes | None:
 
 class _Handler(http.server.BaseHTTPRequestHandler):
 
+    protocol_version = "HTTP/1.1"
     api_key: str | None = None
     auth_file_path: str | None = None
     default_model: str = DEFAULT_MODEL
 
     def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0"))
+        raw_length = self.headers.get("Content-Length")
+        if raw_length is None:
+            self.close_connection = True
+            self._send_error(411, "Content-Length header is required", "invalid_request_error")
+            raise _OpenAIError(411, "missing content length")
+        try:
+            length = int(raw_length)
+        except ValueError:
+            self.close_connection = True
+            self._send_error(400, "Invalid Content-Length header", "invalid_request_error")
+            raise _OpenAIError(400, "bad content length")
+        if length < 0:
+            self.close_connection = True
+            self._send_error(400, "Invalid Content-Length header", "invalid_request_error")
+            raise _OpenAIError(400, "bad content length")
         if length > MAX_BODY:
+            self.close_connection = True
             self._send_error(413, "Request body too large", "invalid_request_error")
             raise _OpenAIError(413, "too large")
         raw = self.rfile.read(length)
         try:
-            return json.loads(raw.decode("utf-8"))
+            parsed = json.loads(raw.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._send_error(400, "Invalid JSON in request body", "invalid_request_error")
             raise _OpenAIError(400, "bad json")
+        if not isinstance(parsed, dict):
+            self._send_error(400, "Request body must be a JSON object", "invalid_request_error")
+            raise _OpenAIError(400, "non-object json")
+        return parsed
 
     def _check_api_key(self) -> bool:
         if self.api_key is None:
             return True
         auth = self.headers.get("Authorization", "")
-        if auth == f"Bearer {self.api_key}":
+        if hmac.compare_digest(auth.encode("utf-8"),
+                               f"Bearer {self.api_key}".encode("utf-8")):
             return True
         self._send_error(401, "Missing or invalid API key", "authentication_error")
         return False
@@ -618,6 +757,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                      "code": code or str(status)}}).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         if extra_headers:
             for k, v in extra_headers.items():
                 if v:
@@ -635,6 +775,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -652,15 +793,17 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
-        if self.path == "/health":
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/health":
             self._handle_health()
-        elif self.path == "/v1/models":
+        elif path == "/v1/models":
             self._handle_models()
         else:
             self._handle_404()
 
     def do_POST(self):
-        if self.path == "/v1/chat/completions":
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/v1/chat/completions":
             self._handle_chat()
         else:
             self._handle_404()
@@ -669,6 +812,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         self._send_error(404, "Not found", "invalid_request_error")
 
     def _handle_health(self):
+        if not self._check_api_key():
+            return
         try:
             entry = read_auth(self.auth_file_path)
         except Exception:
@@ -699,6 +844,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         except _OpenAIError:
             return
 
+        messages = body.get("messages")
+        if not isinstance(messages, list) or not all(isinstance(m, dict) for m in messages):
+            self._send_error(400, "'messages' must be an array of objects",
+                             "invalid_request_error")
+            return
+        if "stream" in body and not isinstance(body["stream"], bool):
+            self._send_error(400, "'stream' must be a boolean", "invalid_request_error")
+            return
+
         entry = read_auth(self.auth_file_path)
         if not entry:
             self._send_error(401, "Not authenticated — run 'xgroxy login' first",
@@ -720,13 +874,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         is_stream = body.get("stream", False)
 
         if is_stream:
-            self._handle_stream(body)
+            self._handle_stream(body, token, entry)
         else:
             self._handle_nonstream(body, token, entry)
 
     def _handle_nonstream(self, body: dict, token: str, entry: dict):
         """Handle a non-streaming chat request with reactive refresh."""
-        forward = _forward_fields(body)
+        forward = _forward_fields(body, self.default_model)
         status, upstream, headers = _upstream_request(forward, token)
 
         # Reactive refresh on 401
@@ -755,114 +909,101 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
         self._send_json(status, upstream)
 
-    def _handle_stream(self, body: dict):
+    def _handle_stream(self, body: dict, token: str, entry: dict):
         stream_options = body.get("stream_options")
         include_usage = (
             isinstance(stream_options, dict)
             and stream_options.get("include_usage", False)
         )
 
+        forward = _forward_fields(body, self.default_model)
+        try:
+            resp = self._open_upstream_stream(forward, token)
+        except urllib.error.HTTPError as first_error:
+            if first_error.code == 401 and entry.get("refresh_token"):
+                first_error.close()
+                try:
+                    entry = refresh_token(entry, self.auth_file_path, force=True)
+                    resp = self._open_upstream_stream(forward, entry.get("key", ""))
+                except urllib.error.HTTPError as retry_error:
+                    self._send_upstream_http_error(retry_error)
+                    return
+                except (urllib.error.URLError, TimeoutError, OSError) as e:
+                    self._send_connection_error(e)
+                    return
+                except Exception as e:
+                    self._send_error(401, f"Token refresh failed: {e}",
+                                     "authentication_error", "token_expired")
+                    return
+            else:
+                self._send_upstream_http_error(first_error)
+                return
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            self._send_connection_error(e)
+            return
+
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        # BaseHTTPRequestHandler does not add HTTP/1.1 chunk framing. Close the
+        # connection after [DONE] so clients can reliably detect the SSE end.
+        self.send_header("Connection", "close")
+        self.close_connection = True
         self.send_header("X-Accel-Buffering", "no")
         self._cors_headers()
         self.end_headers()
 
         try:
-            self._stream_upstream(body, include_usage)
+            self._relay_stream(resp, include_usage)
         except (ConnectionError, BrokenPipeError, OSError):
             # Client disconnected
             pass
+        finally:
+            resp.close()
 
-    def _stream_upstream(self, body: dict, include_usage: bool):
-        """Stream from upstream, rewriting chunks."""
-        forward = _forward_fields(body)
-
+    @staticmethod
+    def _open_upstream_stream(forward: dict, token: str):
         data = json.dumps(forward).encode("utf-8")
         req = urllib.request.Request(UPSTREAM_CHAT_URL, data=data, method="POST")
         req.add_header("Content-Type", "application/json")
-
-        entry = read_auth(self.auth_file_path)
-        token = entry.get("key", "")
         req.add_header("Authorization", f"Bearer {token}")
+        return urllib.request.urlopen(req, timeout=300)
 
+    def _send_upstream_http_error(self, error: urllib.error.HTTPError):
         try:
-            resp = urllib.request.urlopen(req, timeout=300)
-        except urllib.error.HTTPError as e:
-            if e.code == 401 and entry.get("refresh_token"):
+            raw = error.read().decode("utf-8", errors="replace")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                payload = {"error": {"message": raw or error.reason}}
+            message = _extract_error_message(payload)
+            err_type = "authentication_error" if error.code == 401 else "upstream_error"
+            self._send_error(error.code, message, err_type, str(error.code))
+        finally:
+            error.close()
+
+    def _send_connection_error(self, error: Exception):
+        reason = getattr(error, "reason", error)
+        self._send_error(502, f"Could not connect to xAI: {reason}", "upstream_error", "502")
+
+    def _relay_stream(self, resp, include_usage: bool):
+        """Relay complete SSE lines immediately instead of buffering 4 KiB."""
+        try:
+            for raw_line in resp:
+                line = raw_line.strip()
+                if not line or not line.startswith(b"data:"):
+                    continue
+                data_str = line[5:].lstrip().decode("utf-8", errors="replace")
+                if data_str == "[DONE]":
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    return
                 try:
-                    entry = refresh_token(entry, self.auth_file_path, force=True)
-                    token = entry.get("key", "")
-                    data2 = json.dumps(forward).encode("utf-8")
-                    req2 = urllib.request.Request(UPSTREAM_CHAT_URL, data=data2, method="POST")
-                    req2.add_header("Content-Type", "application/json")
-                    req2.add_header("Authorization", f"Bearer {token}")
-                    resp = urllib.request.urlopen(req2, timeout=300)
-                except urllib.error.HTTPError as e2:
-                    err = _error_json(e2.code, "Upstream error", "upstream_error", str(e2.code))
-                    self.wfile.write(_openai_sse_event(err[1]))
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    return
-                except Exception:
-                    self.wfile.write(_openai_sse_event(
-                        {"error": {"message": "Upstream connection failed", "type": "server_error"}}
-                    ))
-                    self.wfile.write(b"data: [DONE]\n\n")
-                    return
-            else:
-                err = _error_json(e.code, "Upstream error", "upstream_error", str(e.code))
-                self.wfile.write(_openai_sse_event(err[1]))
-                self.wfile.write(b"data: [DONE]\n\n")
-                return
-        except Exception:
-            self.wfile.write(_openai_sse_event(
-                {"error": {"message": "Upstream connection failed", "type": "server_error"}}
-            ))
-            self.wfile.write(b"data: [DONE]\n\n")
-            return
-
-        try:
-            # Read lines incrementally
-            pending = b""
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-                pending += chunk
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    line = line.strip()
-                    if not line:
-                        continue
-                    if line.startswith(b"data: "):
-                        data_str = line[6:].decode("utf-8", errors="replace")
-                        if data_str == "[DONE]":
-                            self.wfile.write(b"data: [DONE]\n\n")
-                            return
-                        try:
-                            event = json.loads(data_str)
-                            rewritten = _rewrite_sse_chunk(event, include_usage)
-                            if rewritten:
-                                self.wfile.write(rewritten)
-                        except json.JSONDecodeError:
-                            continue
-
-            # Handle any remaining data
-            if pending.strip():
-                line = pending.strip()
-                if line.startswith(b"data: "):
-                    data_str = line[6:].decode("utf-8", errors="replace")
-                    if data_str == "[DONE]":
-                        self.wfile.write(b"data: [DONE]\n\n")
-                    else:
-                        try:
-                            event = json.loads(data_str)
-                            rewritten = _rewrite_sse_chunk(event, include_usage)
-                            if rewritten:
-                                self.wfile.write(rewritten)
-                        except json.JSONDecodeError:
-                            pass
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+                rewritten = _rewrite_sse_chunk(event, include_usage)
+                if rewritten:
+                    self.wfile.write(rewritten)
 
             # Always send DONE at end if not already sent
             self.wfile.write(b"data: [DONE]\n\n")
@@ -887,12 +1028,19 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     api_key = args.api_key or os.environ.get("XGROXY_API_KEY")
     model = args.model or DEFAULT_MODEL
+    if args.host not in ("127.0.0.1", "::1", "localhost") and not api_key:
+        print("WARNING: non-loopback host without --api-key exposes the proxy to the network.",
+              file=sys.stderr)
 
     _Handler.api_key = api_key
     _Handler.auth_file_path = args.auth_file
     _Handler.default_model = model
 
-    server = _ThreadedServer((args.host, args.port), _Handler)
+    try:
+        server = _ThreadedServer((args.host, args.port), _Handler)
+    except (OSError, OverflowError) as e:
+        print(f"Could not listen on {args.host}:{args.port}: {e}", file=sys.stderr)
+        sys.exit(1)
     email = entry.get("email", "not authenticated")
     expires = entry.get("expires_at", "N/A")
 
@@ -903,7 +1051,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
     def _shutdown(sig, frame):
         print("\nShutting down...")
-        server.shutdown()
+        # HTTPServer.shutdown() waits for serve_forever(), so calling it in the
+        # main thread's signal handler deadlocks. Let a helper thread do it.
+        threading.Thread(target=server.shutdown, daemon=True).start()
 
     signal.signal(signal.SIGINT, _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
@@ -912,6 +1062,8 @@ def cmd_serve(args: argparse.Namespace) -> None:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        server.server_close()
 
 
 # --- Main ---
@@ -926,6 +1078,15 @@ def main() -> None:
 
     sub = parser.add_subparsers(dest="command")
 
+    def port_number(value: str) -> int:
+        try:
+            port = int(value)
+        except ValueError as e:
+            raise argparse.ArgumentTypeError("port must be an integer") from e
+        if not 1 <= port <= 65535:
+            raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+        return port
+
     # login
     p_login = sub.add_parser("login", help="Run device-flow login")
     p_login.add_argument("--auth-file", help="Path to auth.json")
@@ -933,7 +1094,7 @@ def main() -> None:
     # serve
     p_serve = sub.add_parser("serve", help="Start HTTP server")
     p_serve.add_argument("--host", default="127.0.0.1")
-    p_serve.add_argument("--port", type=int, default=8788)
+    p_serve.add_argument("--port", type=port_number, default=8788)
     p_serve.add_argument("--api-key", help="Require Bearer token on local endpoint")
     p_serve.add_argument("--auth-file", help="Path to auth.json")
     p_serve.add_argument("--model", default=DEFAULT_MODEL, help="Default model name")
@@ -952,7 +1113,7 @@ def main() -> None:
         help="Install + enable a systemd user service (starts at login)",
     )
     p_inst.add_argument("--host", default="127.0.0.1")
-    p_inst.add_argument("--port", type=int, default=8788)
+    p_inst.add_argument("--port", type=port_number, default=8788)
     p_inst.add_argument("--api-key", help="Require Bearer token on local endpoint")
     p_inst.add_argument("--auth-file", help="Path to auth.json")
     p_inst.add_argument("--model", default=DEFAULT_MODEL, help="Default model name")
@@ -968,20 +1129,27 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "login":
-        cmd_login(args)
-    elif args.command == "serve":
-        cmd_serve(args)
-    elif args.command == "status":
-        cmd_status(args)
-    elif args.command == "token":
-        cmd_token(args)
-    elif args.command == "install-service":
-        cmd_install_service(args)
-    elif args.command == "uninstall-service":
-        cmd_uninstall_service(args)
-    else:
-        parser.print_help()
+    try:
+        if args.command == "login":
+            cmd_login(args)
+        elif args.command == "serve":
+            cmd_serve(args)
+        elif args.command == "status":
+            cmd_status(args)
+        elif args.command == "token":
+            cmd_token(args)
+        elif args.command == "install-service":
+            cmd_install_service(args)
+        elif args.command == "uninstall-service":
+            cmd_uninstall_service(args)
+        else:
+            parser.print_help()
+            sys.exit(1)
+    except KeyboardInterrupt:
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(130)
+    except (RuntimeError, OSError) as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
 
