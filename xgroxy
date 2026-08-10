@@ -10,7 +10,9 @@ import argparse
 import http.server
 import json
 import os
+import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -29,7 +31,8 @@ try:
 except Exception:
     pass
 
-__version__ = "1.0.1"
+__version__ = "1.1.0"
+SERVICE_NAME = "xgroxy.service"
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 SCOPE = (
@@ -314,6 +317,134 @@ def cmd_status(args: argparse.Namespace) -> None:
 def cmd_token(args: argparse.Namespace) -> None:
     entry = _require_auth(args)
     print(entry.get("key", ""))
+
+
+# --- CLI: install-service / uninstall-service (systemd user unit) ---
+
+
+def _systemd_user_unit_path() -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / SERVICE_NAME
+
+
+def _resolve_self_path() -> Path:
+    """Absolute path to this script (stable ExecStart target)."""
+    return Path(os.path.realpath(sys.argv[0])).resolve()
+
+
+def _systemctl_user(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    cmd = ["systemctl", "--user", *args]
+    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def _build_unit_text(
+    script: Path,
+    host: str,
+    port: int,
+    api_key: str | None,
+    model: str,
+    auth_file: str | None,
+) -> str:
+    exec_parts = [sys.executable, str(script), "serve", "--host", host, "--port", str(port)]
+    if model:
+        exec_parts.extend(["--model", model])
+    if api_key:
+        exec_parts.extend(["--api-key", api_key])
+    if auth_file:
+        exec_parts.extend(["--auth-file", auth_file])
+    # Quote each arg for systemd ExecStart
+    exec_start = " ".join(
+        f'"{p}"' if any(c in p for c in " \t\"'\\") else p for p in exec_parts
+    )
+    env_lines = []
+    if api_key:
+        # Prefer flag above; env is a belt-and-suspenders for wrappers
+        env_lines.append(f"Environment=XGROXY_API_KEY={api_key}")
+    if auth_file:
+        env_lines.append(f"Environment=XGROXY_AUTH_FILE={auth_file}")
+    env_block = ("\n".join(env_lines) + "\n") if env_lines else ""
+    return f"""[Unit]
+Description=xgroxy — local OpenAI-compatible Grok API (X Premium+)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exec_start}
+Restart=on-failure
+RestartSec=5
+{env_block}# Do not inherit a restrictive umask that would break 0600 auth writes oddly
+UMask=0077
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def cmd_install_service(args: argparse.Namespace) -> None:
+    if not shutil.which("systemctl"):
+        print("systemctl not found — systemd user services are not available.", file=sys.stderr)
+        print("Start manually at login, e.g. add to your shell profile:", file=sys.stderr)
+        print(f"  {sys.executable} {_resolve_self_path()} serve >/tmp/xgroxy.log 2>&1 &", file=sys.stderr)
+        sys.exit(1)
+
+    # Warn if not logged in yet (service can still install)
+    entry = read_auth(args.auth_file)
+    if not entry:
+        path = _auth_file_path(args.auth_file)
+        print(f"Note: no auth at {path} yet. Run 'xgroxy login' before expecting requests to work.")
+
+    script = _resolve_self_path()
+    unit_path = _systemd_user_unit_path()
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    text = _build_unit_text(
+        script=script,
+        host=args.host,
+        port=args.port,
+        api_key=args.api_key or os.environ.get("XGROXY_API_KEY"),
+        model=args.model or DEFAULT_MODEL,
+        auth_file=args.auth_file,
+    )
+    unit_path.write_text(text, encoding="utf-8")
+    print(f"Wrote {unit_path}")
+
+    try:
+        _systemctl_user("daemon-reload")
+        _systemctl_user("enable", "--now", SERVICE_NAME)
+    except subprocess.CalledProcessError as e:
+        print(e.stderr or e.stdout or str(e), file=sys.stderr)
+        print(f"Unit written but enable/start failed. Try:\n  systemctl --user enable --now {SERVICE_NAME}", file=sys.stderr)
+        sys.exit(1)
+
+    # Linger so the service survives logout (optional; best-effort)
+    if args.linger:
+        try:
+            subprocess.run(
+                ["loginctl", "enable-linger", os.environ.get("USER", "")],
+                check=False, capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            pass
+
+    st = _systemctl_user("is-active", SERVICE_NAME, check=False)
+    active = (st.stdout or "").strip()
+    print(f"Service:  {SERVICE_NAME} ({active or 'unknown'})")
+    print(f"Endpoint: http://{args.host}:{args.port}/v1")
+    print(f"Logs:     journalctl --user -u {SERVICE_NAME} -f")
+    print(f"Stop:     systemctl --user stop {SERVICE_NAME}")
+    print(f"Disable:  xgroxy uninstall-service")
+
+
+def cmd_uninstall_service(args: argparse.Namespace) -> None:
+    unit_path = _systemd_user_unit_path()
+    if shutil.which("systemctl"):
+        _systemctl_user("disable", "--now", SERVICE_NAME, check=False)
+        _systemctl_user("daemon-reload", check=False)
+    if unit_path.exists():
+        unit_path.unlink()
+        print(f"Removed {unit_path}")
+    else:
+        print(f"No unit at {unit_path}")
+    print("xgroxy will no longer start at login.")
 
 
 # --- HTTP server ---
@@ -815,6 +946,26 @@ def main() -> None:
     p_token = sub.add_parser("token", help="Print access token")
     p_token.add_argument("--auth-file", help="Path to auth.json")
 
+    # install-service / uninstall-service
+    p_inst = sub.add_parser(
+        "install-service",
+        help="Install + enable a systemd user service (starts at login)",
+    )
+    p_inst.add_argument("--host", default="127.0.0.1")
+    p_inst.add_argument("--port", type=int, default=8788)
+    p_inst.add_argument("--api-key", help="Require Bearer token on local endpoint")
+    p_inst.add_argument("--auth-file", help="Path to auth.json")
+    p_inst.add_argument("--model", default=DEFAULT_MODEL, help="Default model name")
+    p_inst.add_argument(
+        "--linger",
+        action="store_true",
+        help="Also run loginctl enable-linger (keep service after logout)",
+    )
+    p_uninst = sub.add_parser(
+        "uninstall-service",
+        help="Stop and remove the systemd user service",
+    )
+
     args = parser.parse_args()
 
     if args.command == "login":
@@ -825,6 +976,10 @@ def main() -> None:
         cmd_status(args)
     elif args.command == "token":
         cmd_token(args)
+    elif args.command == "install-service":
+        cmd_install_service(args)
+    elif args.command == "uninstall-service":
+        cmd_uninstall_service(args)
     else:
         parser.print_help()
         sys.exit(1)

@@ -73,9 +73,9 @@ Set up xgroxy on this machine:
      authorize in my browser — do not continue until I confirm authorization
      succeeded (check with `xgroxy status`).
 
-3. Start the server in the background and keep it running:
-   xgroxy serve > /tmp/xgroxy.log 2>&1 &
-   # or leave a terminal open with `xgroxy serve`
+3. Start at login (preferred on Linux/systemd):
+   xgroxy install-service
+   # falls back if no systemd: xgroxy serve > /tmp/xgroxy.log 2>&1 &
 
 4. Verify it works, then report the result:
    curl -s http://127.0.0.1:8788/health        # expect {"status":"ok",...}
@@ -128,13 +128,34 @@ signed in as you@example.com · token exp 2026-08-10T19:05:28.000Z
 model grok-4.5
 ```
 
-To keep it running in the background:
+### 3. Start at login (recommended)
+
+On Linux with systemd (most desktops/servers):
+
+```bash
+xgroxy install-service
+# → writes ~/.config/systemd/user/xgroxy.service
+# → systemctl --user enable --now xgroxy
+```
+
+That's it — the API comes up every time you log in. Useful commands:
+
+```bash
+systemctl --user status xgroxy
+journalctl --user -u xgroxy -f
+xgroxy uninstall-service          # stop + remove
+```
+
+Optional flags match `serve`: `--host`, `--port`, `--api-key`, `--model`, `--auth-file`.
+Add `--linger` if you want it to keep running after logout (`loginctl enable-linger`).
+
+No systemd? Background it yourself:
 
 ```bash
 xgroxy serve > /tmp/xgroxy.log 2>&1 &
 ```
 
-### 3. Use it
+### 4. Use it
 
 ```bash
 curl http://127.0.0.1:8788/v1/chat/completions \
@@ -183,6 +204,9 @@ xgroxy serve [--host H] [--port P]  start the API server (default 127.0.0.1:8788
             [--api-key KEY]         require this Bearer key on local requests
             [--auth-file PATH]      use a specific token file
             [--model M]             default model (default grok-4.5)
+xgroxy install-service [...]        systemd user unit — starts at login
+            [--linger]              also enable-linger (survive logout)
+xgroxy uninstall-service            stop + remove the user unit
 xgroxy status [--auth-file PATH]    show who you're signed in as + token expiry
 xgroxy token [--auth-file PATH]     print the raw access token (debugging)
 xgroxy --version
@@ -250,7 +274,8 @@ Any OpenAI-compatible client: set `base_url` (or `OPENAI_BASE_URL`) to
 | Login hangs with no URL printed | Output was fully buffered (pipes/agents). Upgrade to ≥1.0.1, or run `PYTHONUNBUFFERED=1 xgroxy login` |
 | Model name errors | Some X plans expose only `grok-4.5`; try `--model grok-4.5` |
 | It works, then stops after hours | Access token expired — that's normal, refresh is automatic. If it *keeps* failing, your X session was revoked; re-run `login`. |
-| Server dies when terminal closes | Run in background: `xgroxy serve > /tmp/xgroxy.log 2>&1 &` or use a process manager |
+| Server dies when terminal closes | `xgroxy install-service` (systemd), or `xgroxy serve > /tmp/xgroxy.log 2>&1 &` |
+| Service won't start at boot/login | `systemctl --user status xgroxy`; on headless hosts try `loginctl enable-linger $USER` |
 
 ## FAQ
 
