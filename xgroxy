@@ -21,7 +21,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from socketserver import ThreadingMixIn
 
-__version__ = "1.0.0"
+# Agents and pipes buffer stdout fully; force line-buffering so login URLs
+# and serve banners appear immediately (not only after exit).
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except Exception:
+    pass
+
+__version__ = "1.0.1"
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 SCOPE = (
@@ -203,13 +211,15 @@ def cmd_login(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     print()
-    print("┌─────────────────────────────────────────┐")
-    print(f"│  Open: {verification_uri}")
-    print(f"│  Enter code: {user_code}")
+    print("  1. Open this URL in your browser (must be logged into your X account):")
     if verification_uri_complete:
-        print(f"│  Or visit: {verification_uri_complete}")
-    print("└─────────────────────────────────────────┘")
+        print(f"     {verification_uri_complete}")
+    else:
+        print(f"     {verification_uri}")
     print()
+    print(f"  2. Enter code:  {user_code}")
+    print("     Waiting for authorization...")
+    print(flush=True)
 
     # Step 2: poll for token
     deadline = time.time() + expires_in
@@ -223,7 +233,7 @@ def cmd_login(args: argparse.Namespace) -> None:
                 "client_id": CLIENT_ID,
             })
         except RuntimeError as e:
-            print(f"Token request error: {e}", file=sys.stderr)
+            print(f"Token request error: {e}", file=sys.stderr, flush=True)
             continue
 
         error = token_resp.get("error")
@@ -233,7 +243,7 @@ def cmd_login(args: argparse.Namespace) -> None:
             interval += 5
             continue
         elif error in ("access_denied", "expired_token"):
-            print(f"Login failed: {error}", file=sys.stderr)
+            print(f"Login failed: {error}", file=sys.stderr, flush=True)
             sys.exit(1)
 
         access_token = token_resp.get("access_token")
@@ -271,10 +281,10 @@ def cmd_login(args: argparse.Namespace) -> None:
                 "_auth_path": str(_auth_file_path(auth_path)),
             }
             write_auth(entry, auth_path)
-            print(f"Login successful! Email: {email or 'unknown'}")
+            print(f"Login successful! Email: {email or 'unknown'}", flush=True)
             return
 
-    print("Login timed out waiting for authorization.", file=sys.stderr)
+    print("Login timed out waiting for authorization.", file=sys.stderr, flush=True)
     sys.exit(1)
 
 
@@ -755,16 +765,10 @@ def cmd_serve(args: argparse.Namespace) -> None:
     email = entry.get("email", "not authenticated")
     expires = entry.get("expires_at", "N/A")
 
-    print(f"xgroxy {__version__} — OpenAI-compatible server")
-    print(f"Listening: http://{args.host}:{args.port}")
-    print(f"Model:     {model}")
-    print(f"Email:     {email}")
-    print(f"Token exp: {expires}")
-    if api_key:
-        print(f"API key:   required (set via --api-key or XGROXY_API_KEY)")
-    else:
-        print(f"API key:   not required (no --api-key set)")
-    print()
+    print(f"xgroxy {__version__} — Grok on http://{args.host}:{args.port}", flush=True)
+    print(f"signed in as {email} · token exp {expires}", flush=True)
+    print(f"model {model}" + (" · API key required" if api_key else ""), flush=True)
+    print(flush=True)
 
     def _shutdown(sig, frame):
         print("\nShutting down...")
