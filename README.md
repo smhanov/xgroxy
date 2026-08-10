@@ -39,11 +39,42 @@ your OpenAI-compatible tool
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOURNAME/xgroxy/main/xgroxy -o xgroxy
+curl -fsSL https://raw.githubusercontent.com/smhanov/xgroxy/main/xgroxy -o xgroxy
 chmod +x xgroxy
 ```
 
 *(No pip, no npm, no lockfile. The whole program is one file you can read.)*
+
+## Setup with any coding agent
+
+Don't want to type commands? Copy this prompt into your coding agent
+(Claude Code, OpenCode, Codex, Cursor, Continue, ...) and let it set
+everything up on this machine:
+
+```text
+Set up xgroxy on this machine:
+
+1. Install the single-file program (Python 3.8+ is the only requirement):
+   curl -fsSL https://raw.githubusercontent.com/smhanov/xgroxy/main/xgroxy -o ~/bin/xgroxy
+   chmod +x ~/bin/xgroxy
+   (create ~/bin and add it to PATH if needed)
+
+2. Run `xgroxy login`. It prints a URL and a one-time code. Show them to
+   me and WAIT while I authorize in my browser — do not continue until I
+   confirm. If I already have a ~/.grok/auth.json (grok CLI), skip this
+   step entirely.
+
+3. Start the server: `xgroxy serve` (background it or leave a terminal).
+
+4. Verify it works, then report the result:
+   curl -s http://127.0.0.1:8788/health        # expect {"status":"ok",...}
+   curl -s http://127.0.0.1:8788/v1/chat/completions \
+     -H "Content-Type: application/json" \
+     -d '{"model":"grok-4.5","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
+
+Notes: requires an X Premium+ or SuperGrok subscription. Never print or
+commit the token. If login is needed, always pause and ask me to authorize.
+```
 
 ## Quick start
 
