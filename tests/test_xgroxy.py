@@ -150,7 +150,7 @@ class ServiceTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("systemd-analyze"), "systemd-analyze not installed")
     def test_generated_systemd_unit_passes_systemd_validation(self):
         unit = xgroxy._build_unit_text(
-            SCRIPT, "127.0.0.1", 8788, None, "grok-4.5", "/tmp/auth.json")
+            SCRIPT, "127.0.0.1", 8788, None, "grok-4.6", "/tmp/auth.json")
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "xgroxy.service"
             path.write_text(unit, encoding="utf-8")

@@ -81,13 +81,13 @@ Set up xgroxy on this machine:
    curl -s http://127.0.0.1:8788/health        # expect {"status":"ok",...}
    curl -s http://127.0.0.1:8788/v1/chat/completions \
      -H "Content-Type: application/json" \
-     -d '{"model":"grok-4.5","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
+     -d '{"model":"grok-4.6","messages":[{"role":"user","content":"Reply with exactly: OK"}]}'
 
 5. Wire the local endpoint into the agent config if applicable:
    - OpenCode: ~/.config/opencode/opencode.json or opencode.jsonc
      { "provider": { "xai": { "options": {
          "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "xgroxy" } } } }
-   - Then use model xai/grok-4.5
+   - Then use model xai/grok-4.6
 
 Notes: requires an X Premium+ or SuperGrok subscription. Never print or
 commit the token. If login is needed, always pause and ask me to authorize.
@@ -125,7 +125,7 @@ xgroxy serve
 ```
 xgroxy 1.1.1 — Grok on http://127.0.0.1:8788
 signed in as you@example.com · token exp 2026-08-10T19:05:28.000Z
-model grok-4.5
+model grok-4.6
 ```
 
 ### 3. Start at login (recommended)
@@ -160,7 +160,7 @@ xgroxy serve > /tmp/xgroxy.log 2>&1 &
 ```bash
 curl http://127.0.0.1:8788/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"grok-4.5","messages":[{"role":"user","content":"Say hello in one line"}]}'
+  -d '{"model":"grok-4.6","messages":[{"role":"user","content":"Say hello in one line"}]}'
 ```
 
 Or with the OpenAI SDK:
@@ -168,7 +168,7 @@ Or with the OpenAI SDK:
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://127.0.0.1:8788/v1", api_key="xgroxy")
-r = client.chat.completions.create(model="grok-4.5", messages=[{"role":"user","content":"hi"}])
+r = client.chat.completions.create(model="grok-4.6", messages=[{"role":"user","content":"hi"}])
 print(r.choices[0].message.content)
 ```
 
@@ -176,7 +176,7 @@ Or with a coding agent (tools run on *your* machine):
 
 ```bash
 # OpenCode
-opencode run "list the files here" --model xai/grok-4.5   # baseURL → http://127.0.0.1:8788/v1
+opencode run "list the files here" --model xai/grok-4.6   # baseURL → http://127.0.0.1:8788/v1
 ```
 
 ## How the magic works
@@ -201,7 +201,7 @@ xgroxy login [--auth-file PATH]     sign in (OAuth device flow)
 xgroxy serve [--host H] [--port P]  start the API server (default 127.0.0.1:8788)
             [--api-key KEY]         require this Bearer key on local requests
             [--auth-file PATH]      use a specific token file
-            [--model M]             default model (default grok-4.5)
+            [--model M]             default model (default grok-4.6)
 xgroxy install-service [...]        systemd user unit — starts at login
             [--linger]              also enable-linger (survive logout)
 xgroxy uninstall-service            stop + remove the user unit
@@ -232,13 +232,13 @@ Environment variable: `XGROXY_AUTH_FILE` (same as `--auth-file`).
 ```
 
 ```bash
-opencode run "what's in this repo?" --model xai/grok-4.5
+opencode run "what's in this repo?" --model xai/grok-4.6
 ```
 
 ### Anything else
 
 Any OpenAI-compatible client: set `base_url` (or `OPENAI_BASE_URL`) to
-`http://127.0.0.1:8788/v1`, model `grok-4.5`, any API key.
+`http://127.0.0.1:8788/v1`, model `grok-4.6`, any API key.
 
 Clients that only speak Anthropic's `/v1/messages` protocol are not directly
 supported; they need an OpenAI-compatible provider or adapter.
@@ -264,7 +264,7 @@ supported; they need an OpenAI-compatible provider or adapter.
 | `address already in use` | Another server is on 8788: `xgroxy serve --port 8790` |
 | Browser says *code invalid/expired* | Device codes last 30 min — just run `login` again |
 | Login hangs with no URL printed | Output was fully buffered (pipes/agents). Upgrade to ≥1.0.1, or run `PYTHONUNBUFFERED=1 xgroxy login` |
-| Model name errors | Some X plans expose only `grok-4.5`; try `--model grok-4.5` |
+| Model name errors | Some X plans expose only older model names (e.g. `grok-4.5`); try `--model grok-4.5` as a fallback |
 | It works, then stops after hours | Access token expired — that's normal, refresh is automatic. If it *keeps* failing, your X session was revoked; re-run `login`. |
 | Server dies when terminal closes | `xgroxy install-service` (systemd), or `xgroxy serve > /tmp/xgroxy.log 2>&1 &` |
 | Service won't start at boot/login | `systemctl --user status xgroxy`; on headless hosts try `loginctl enable-linger $USER` |
