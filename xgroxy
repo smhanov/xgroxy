@@ -47,7 +47,7 @@ TOKEN_URL = f"{OAUTH_ISSUER}/oauth2/token"
 USERINFO_URL = f"{OAUTH_ISSUER}/oauth2/userinfo"
 UPSTREAM_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 VERIFICATION_PAGE = "https://accounts.x.ai/oauth2/device"
-DEFAULT_MODEL = "grok-4.5"
+DEFAULT_MODEL = "grok-4.6"
 MAX_BODY = 10 * 1024 * 1024
 
 # --- Auth file helpers ---
