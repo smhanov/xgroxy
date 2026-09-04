@@ -33,7 +33,7 @@ try:
 except Exception:
     pass
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 SERVICE_NAME = "xgroxy.service"
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -49,6 +49,22 @@ UPSTREAM_CHAT_URL = "https://api.x.ai/v1/chat/completions"
 VERIFICATION_PAGE = "https://accounts.x.ai/oauth2/device"
 DEFAULT_MODEL = "grok-4.6"
 MAX_BODY = 10 * 1024 * 1024
+
+# Published model limits (xAI docs, mirrored by models.dev — the catalog
+# OpenCode and other agents build their context budget from). When a client's
+# bundled catalog is stale and lacks a model, it falls back to a small default
+# (e.g. 128k tokens) and silently compacts/truncates long before the real
+# window is full. We advertise the real numbers via GET /v1/models and the
+# README shows how to pin them in client configs.
+MODEL_LIMITS = {
+    "grok-4.6": {"context": 500000, "output": 500000},
+    "grok-4.5": {"context": 500000, "output": 500000},
+    "grok-4.3": {"context": 1000000, "output": 30000},
+    "grok-4.20-0309-reasoning": {"context": 1000000, "output": 30000},
+    "grok-4.20-0309-non-reasoning": {"context": 1000000, "output": 30000},
+    "grok-4.20-multi-agent-0309": {"context": 1000000, "output": 30000},
+    "grok-build-0.1": {"context": 256000, "output": 256000},
+}
 
 # --- Auth file helpers ---
 
@@ -827,13 +843,24 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def _handle_models(self):
         if not self._check_api_key():
             return
-        self._send_json(200, {
-            "object": "list",
-            "data": [
-                {"id": self.default_model, "object": "model",
-                 "created": 0, "owned_by": "xai"},
-            ],
-        })
+        limits = MODEL_LIMITS.get(self.default_model)
+        if limits:
+            # Extra metadata keys are ignored by plain OpenAI clients but let
+            # agents (OpenCode, etc.) that fetch /v1/models see the real
+            # context window instead of falling back to a small default.
+            model_entry = {
+                "id": self.default_model, "object": "model",
+                "created": 0, "owned_by": "xai",
+                "context_window": limits["context"],
+                "max_output_tokens": limits["output"],
+                "limit": {"context": limits["context"], "output": limits["output"]},
+            }
+        else:
+            model_entry = {
+                "id": self.default_model, "object": "model",
+                "created": 0, "owned_by": "xai",
+            }
+        self._send_json(200, {"object": "list", "data": [model_entry]})
 
     def _handle_chat(self):
         if not self._check_api_key():

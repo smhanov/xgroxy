@@ -262,6 +262,41 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(b'test@example.com', data)
 
+    def test_models_reports_real_context_limits(self):
+        # Agents that read /v1/models must see the true window, not guess.
+        self.handler_class.default_model = "grok-4.6"
+        status, _, data = self.request("GET", "/v1/models")
+        self.assertEqual(status, 200)
+        entry = json.loads(data)["data"][0]
+        self.assertEqual(entry["id"], "grok-4.6")
+        self.assertEqual(entry["context_window"], 500000)
+        self.assertEqual(entry["max_output_tokens"], 500000)
+        self.assertEqual(entry["limit"],
+                         {"context": 500000, "output": 500000})
+
+    def test_models_omits_limits_for_unknown_model(self):
+        self.handler_class.default_model = "some-future-model"
+        status, _, data = self.request("GET", "/v1/models")
+        self.assertEqual(status, 200)
+        entry = json.loads(data)["data"][0]
+        self.assertEqual(entry["id"], "some-future-model")
+        self.assertNotIn("limit", entry)
+
+
+class ModelLimitTests(unittest.TestCase):
+    def test_grok46_advertises_the_published_500k_window(self):
+        # xAI docs + models.dev both list 500,000 context for grok-4.6.
+        # If this ever fails, someone changed the table without checking
+        # https://docs.x.ai/developers/models — clients silently fall back to
+        # a 128k-style default when limits are wrong or missing.
+        self.assertEqual(xgroxy.MODEL_LIMITS["grok-4.6"],
+                         {"context": 500000, "output": 500000})
+        self.assertEqual(xgroxy.MODEL_LIMITS["grok-4.5"],
+                         {"context": 500000, "output": 500000})
+        for name, limits in xgroxy.MODEL_LIMITS.items():
+            self.assertGreater(limits["context"], 0, name)
+            self.assertGreater(limits["output"], 0, name)
+
 
 class ProcessTests(unittest.TestCase):
     def test_sigterm_stops_server_without_deadlock(self):

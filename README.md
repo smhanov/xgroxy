@@ -85,9 +85,16 @@ Set up xgroxy on this machine:
 
 5. Wire the local endpoint into the agent config if applicable:
    - OpenCode: ~/.config/opencode/opencode.json or opencode.jsonc
-     { "provider": { "xai": { "options": {
-         "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "xgroxy" } } } }
-   - Then use model xai/grok-4.6
+     Configure the model EXPLICITLY (do not rely on the provider's built-in
+     model catalog — if grok-4.6 is missing from it, OpenCode falls back to a
+     small default context window like 128k and compacts way too early):
+     {
+       "provider": { "xai": { "options": {
+           "baseURL": "http://127.0.0.1:8788/v1", "apiKey": "xgroxy" } },
+         "models": { "xai": { "grok-4.6": {
+           "limit": { "context": 500000, "output": 500000 } } } } }
+     }
+   - Then use model xai/grok-4.6 (real context window: 500,000 tokens)
 
 Notes: requires an X Premium+ or SuperGrok subscription. Never print or
 commit the token. If login is needed, always pause and ask me to authorize.
@@ -217,6 +224,11 @@ Environment variable: `XGROXY_AUTH_FILE` (same as `--auth-file`).
 
 ### OpenCode
 
+OpenCode builds its model catalog from models.dev plus your config. If the
+configured model isn't in that catalog, it silently falls back to a small
+default context window (e.g. 128k) and compacts/truncates long before the
+model's real limit. Declare the model explicitly with the real limits:
+
 ```jsonc
 // ~/.config/opencode/opencode.json  (or opencode.jsonc)
 {
@@ -225,6 +237,12 @@ Environment variable: `XGROXY_AUTH_FILE` (same as `--auth-file`).
       "options": {
         "baseURL": "http://127.0.0.1:8788/v1",
         "apiKey": "xgroxy"
+      },
+      "models": {
+        "grok-4.6": {
+          "name": "Grok 4.6",
+          "limit": { "context": 500000, "output": 500000 }
+        }
       }
     }
   }
@@ -265,6 +283,7 @@ supported; they need an OpenAI-compatible provider or adapter.
 | Browser says *code invalid/expired* | Device codes last 30 min — just run `login` again |
 | Login hangs with no URL printed | Output was fully buffered (pipes/agents). Upgrade to ≥1.0.1, or run `PYTHONUNBUFFERED=1 xgroxy login` |
 | Model name errors | Some X plans expose only older model names (e.g. `grok-4.5`); try `--model grok-4.5` as a fallback |
+| Client uses a tiny context window (e.g. 128k instead of 500k on grok-4.6) | The client doesn't know the model's real limits. `GET /v1/models` now reports them; for OpenCode, declare the model with `limit` in the config (see "Wiring it into your tools") |
 | It works, then stops after hours | Access token expired — that's normal, refresh is automatic. If it *keeps* failing, your X session was revoked; re-run `login`. |
 | Server dies when terminal closes | `xgroxy install-service` (systemd), or `xgroxy serve > /tmp/xgroxy.log 2>&1 &` |
 | Service won't start at boot/login | `systemctl --user status xgroxy`; on headless hosts try `loginctl enable-linger $USER` |
