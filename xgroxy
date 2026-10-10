@@ -33,7 +33,7 @@ try:
 except Exception:
     pass
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 SERVICE_NAME = "xgroxy.service"
 
 CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -569,14 +569,13 @@ class _OpenAIError(Exception):
         self.code = code
 
 
-def _scrub_message(msg: dict) -> dict:
-    """Remove reasoning_content from messages (xAI rejects it)."""
-    cleaned = {k: v for k, v in msg.items() if k != "reasoning_content"}
-    return cleaned
-
-
 def _forward_fields(body: dict, default_model: str = DEFAULT_MODEL) -> dict:
-    """Extract only the fields we forward to the upstream."""
+    """Extract only the fields we forward to the upstream.
+
+    Messages pass through untouched: xAI accepts `reasoning_content` on
+    replayed assistant messages again (verified 2026-10-10), and replaying it
+    preserves the model's own reasoning chain across tool-loop turns.
+    """
     allowed = {
         "model", "messages", "stream", "tools", "tool_choice",
         "temperature", "top_p", "max_tokens", "max_completion_tokens",
@@ -590,8 +589,6 @@ def _forward_fields(body: dict, default_model: str = DEFAULT_MODEL) -> dict:
             result[k] = body[k]
     if "model" not in result:
         result["model"] = default_model
-    if "messages" in result:
-        result["messages"] = [_scrub_message(m) for m in result["messages"]]
     if "stream_options" in body:
         result["stream_options"] = body["stream_options"]
     return result
@@ -674,7 +671,7 @@ def _rewrite_sse_chunk(event_obj: dict, include_usage: bool) -> bytes | None:
         # Preserve standard streaming fields clients use to construct the
         # final message, plus xAI's reasoning extension.
         for field in ("role", "content", "refusal", "reasoning_content"):
-            if field in delta:
+            if field in delta and delta[field] is not None:
                 out_delta[field] = delta[field]
 
         if "tool_calls" in delta:
@@ -694,7 +691,15 @@ def _rewrite_sse_chunk(event_obj: dict, include_usage: bool) -> bytes | None:
                 if "type" in tc:
                     otc["type"] = tc["type"]
                 tc_list.append(otc)
-            out_delta["tool_calls"] = tc_list
+            # Drop EMPTY tool_calls arrays: xAI attaches "tool_calls": [] to
+            # reasoning/content deltas. OpenAI-compatible clients (AI SDK
+            # v5 openai-compatible) treat a non-null tool_calls key as "a tool
+            # call step started", which prematurely closes the active reasoning
+            # part; later reasoning deltas then reference a part that no longer
+            # exists ("reasoning part reasoning-… not found"). Omitting the key
+            # entirely is wire-equivalent and keeps reasoning in one part.
+            if tc_list:
+                out_delta["tool_calls"] = tc_list
 
         rewritten_choices.append({
             "index": choice.get("index", 0),

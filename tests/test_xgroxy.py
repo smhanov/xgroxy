@@ -72,14 +72,59 @@ class AuthTests(unittest.TestCase):
 
 
 class TransformationTests(unittest.TestCase):
-    def test_configured_default_model_is_forwarded_and_reasoning_is_scrubbed(self):
+    def test_configured_default_model_is_forwarded_and_messages_pass_through(self):
         result = xgroxy._forward_fields({
-            "messages": [{"role": "assistant", "content": "ok", "reasoning_content": "hidden"}],
+            "messages": [{"role": "assistant", "content": "ok", "reasoning_content": "chain"}],
             "ignored": "value",
         }, "configured-model")
         self.assertEqual(result["model"], "configured-model")
-        self.assertNotIn("reasoning_content", result["messages"][0])
+        # reasoning_content replay is preserved: xAI accepts it (2026-10).
+        self.assertEqual(result["messages"][0]["reasoning_content"], "chain")
         self.assertNotIn("ignored", result)
+
+    def test_stream_chunk_drops_empty_tool_calls_array(self):
+        # xAI attaches "tool_calls": [] to reasoning deltas; forwarding it
+        # fragments reasoning streams in OpenAI-compatible clients and leads
+        # to "reasoning part ... not found" errors downstream.
+        encoded = xgroxy._rewrite_sse_chunk({
+            "id": "chunk-1",
+            "model": "model-1",
+            "choices": [
+                {"index": 0, "delta": {"reasoning_content": "thinking", "tool_calls": []},
+                 "finish_reason": None},
+            ],
+        }, False)
+        payload = json.loads(encoded.decode()[len("data: "):].strip())
+        self.assertNotIn("tool_calls", payload["choices"][0]["delta"])
+        self.assertEqual(payload["choices"][0]["delta"]["reasoning_content"], "thinking")
+
+    def test_stream_chunk_keeps_populated_tool_calls(self):
+        encoded = xgroxy._rewrite_sse_chunk({
+            "id": "chunk-2",
+            "model": "model-1",
+            "choices": [
+                {"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "c1",
+                 "function": {"name": "read_file", "arguments": "{}"}}]},
+                 "finish_reason": None},
+            ],
+        }, False)
+        payload = json.loads(encoded.decode()[len("data: "):].strip())
+        delta = payload["choices"][0]["delta"]
+        self.assertEqual(len(delta["tool_calls"]), 1)
+        self.assertEqual(delta["tool_calls"][0]["function"]["name"], "read_file")
+
+    def test_stream_chunk_drops_null_reasoning_field(self):
+        encoded = xgroxy._rewrite_sse_chunk({
+            "id": "chunk-3",
+            "model": "model-1",
+            "choices": [
+                {"index": 0, "delta": {"reasoning_content": None, "content": "hi"},
+                 "finish_reason": None},
+            ],
+        }, False)
+        payload = json.loads(encoded.decode()[len("data: "):].strip())
+        self.assertNotIn("reasoning_content", payload["choices"][0]["delta"])
+        self.assertEqual(payload["choices"][0]["delta"]["content"], "hi")
 
     def test_common_openai_and_xai_options_are_forwarded(self):
         body = {
